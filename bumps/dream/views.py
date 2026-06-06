@@ -22,7 +22,7 @@ TRACE_HSPACE = 0.1
 # TODO: plot_all does not allow us to specify variables or their ranges
 # TODO: plot_all not tested with revised handling of derived parameters
 # TODO: remove hack allowing plot_all to accept a state.draw as well as a state object
-def plot_all(state: MCMCDraw | Draw, portion: Optional[float] = None, figfile=None):
+def plot_all(state: MCMCDraw | Draw, portion: Optional[float] = None, figfile=None, extra=None):
     # Print/save uncertainty report before loading matplotlib or creating plots
     if isinstance(state, MCMCDraw):
         draw = state.draw(portion=portion)
@@ -35,7 +35,7 @@ def plot_all(state: MCMCDraw | Draw, portion: Optional[float] = None, figfile=No
         f"\nStatistics and plots based on {len(draw.points)} samples ({int(100 * draw.portion)}% of total samples drawn)"
     )
     if figfile is not None:
-        save_vars(all_vstats, figfile + "-err.json")
+        save_vars(all_vstats, figfile + "-err.json", extra=extra)
 
     import matplotlib.pyplot as plt
 

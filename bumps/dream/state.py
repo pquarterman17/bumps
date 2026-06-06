@@ -812,10 +812,15 @@ class MCMCDraw(object):
         portion = self.portion if portion is None else portion
         return total_gens - int(portion * saved_gens)
 
-    def show(self, portion: Optional[float] = None, figfile: Union[str, Path, None] = None):
+    def show(
+        self,
+        portion: Optional[float] = None,
+        figfile: Union[str, Path, None] = None,
+        extra: Optional[dict] = None,
+    ):
         from .views import plot_all
 
-        plot_all(self, portion=portion, figfile=figfile)
+        plot_all(self, portion=portion, figfile=figfile, extra=extra)
 
     # TODO: _last_gen and _draw_pop do similar things. Can they be merged?
     def _last_gen(self):

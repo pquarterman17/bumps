@@ -205,15 +205,64 @@ def format_vars(all_vstats):
     return "\n".join(s)
 
 
-def save_vars(all_vstats, filename):
+def save_vars(all_vstats, filename, extra=None):
+    """
+    Save the parameter statistics to *filename* as JSON.
+
+    Each parameter appears as a top-level entry keyed by its label, with
+    the fields from :class:`VarStats` (mean, median, best, std, p68, p95, ...).
+
+    *extra* is an optional dictionary of overall fit quality values stored
+    as additional top-level entries, e.g. *chisq* (normalized chi-squared at
+    full precision), *dof* (degrees of freedom) and *points* (number of data
+    points), from which the raw sum of squares can be recovered as
+    chisq*dof. If *chisq* is present and positive, each parameter entry also
+    gets *std_scaled* = std*sqrt(chisq), the standard deviation scaled for
+    over- or under-estimated measurement uncertainty.
+    """
+    payload = dict((v.label, dict(v.__dict__)) for v in all_vstats)
+    if extra:
+        chisq = extra.get("chisq")
+        if chisq is not None and chisq > 0:
+            scale = np.sqrt(chisq)
+            for entry in payload.values():
+                entry["std_scaled"] = entry["std"] * scale
+        payload.update(extra)
     with open(filename, "w") as fid:
         json.dump(
-            dict((v.label, v.__dict__) for v in all_vstats),
+            payload,
             fid,
             default=numpy_json,
             sort_keys=True,
             indent=2,
         )
+
+
+def test_save_vars(tmp_path):
+    vstats = [
+        VarStats(label="P1", index=1, p95=(0.0, 4.0), p68=(1.0, 3.0), median=2.0, mean=2.0, std=0.5, best=2.1),
+        VarStats(label="P2", index=2, p95=(-2.0, 2.0), p68=(-1.0, 1.0), median=0.0, mean=0.1, std=1.0, best=0.0),
+    ]
+    filename = tmp_path / "model-err.json"
+
+    # Without extra: parameter entries only, no scaled uncertainty
+    save_vars(vstats, str(filename))
+    data = json.loads(filename.read_text())
+    assert set(data.keys()) == {"P1", "P2"}
+    assert data["P1"]["mean"] == 2.0
+    assert "std_scaled" not in data["P1"]
+
+    # With extra: fit quality at top level, scaled uncertainty per parameter
+    save_vars(vstats, str(filename), extra={"chisq": 4.0, "dof": 10, "points": 12})
+    data = json.loads(filename.read_text())
+    assert data["chisq"] == 4.0
+    assert data["dof"] == 10
+    assert data["points"] == 12
+    assert data["P1"]["std_scaled"] == 0.5 * 2.0
+    assert data["P2"]["std_scaled"] == 1.0 * 2.0
+    # original statistics unchanged
+    assert data["P1"]["std"] == 0.5
+    assert vstats[0].__dict__.get("std_scaled") is None  # input not mutated
 
 
 def numpy_json(o):
