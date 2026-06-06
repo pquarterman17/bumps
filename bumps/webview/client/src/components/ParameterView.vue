@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import TagFilter from "./ParameterTagFilter.vue";
 import type { AsyncSocket } from "../asyncSocket.ts";
 import { setupDrawLoop } from "../setupDrawLoop";
@@ -32,6 +32,21 @@ type parameter_info = {
 // const parameters = ref<parameter_info[]>([]);
 const parameters_local = ref<parameter_info[]>([]);
 const tag_filter = ref<typeof TagFilter>();
+const search = ref("");
+
+function matchesSearch(param: parameter_info): boolean {
+  const term = search.value.trim().toLowerCase();
+  if (!term) {
+    return true;
+  }
+  return param.name.toLowerCase().includes(term) || param.paths.some((path) => path.toLowerCase().includes(term));
+}
+
+const visible_parameters = computed(() =>
+  (tag_filter.value?.filtered_parameters ?? []).filter(({ parameter }: { parameter: parameter_info }) =>
+    matchesSearch(parameter),
+  ),
+);
 
 async function fetch_and_draw() {
   const payload = (await props.socket.asyncEmit("get_parameters", false)) as parameter_info[];
@@ -71,7 +86,16 @@ async function setFittable(event: MouseEvent, index: number) {
 </script>
 
 <template>
-  <TagFilter ref="tag_filter" :parameters="parameters_local"></TagFilter>
+  <div class="d-flex align-items-start gap-3">
+    <TagFilter ref="tag_filter" :parameters="parameters_local"></TagFilter>
+    <input
+      v-model="search"
+      type="search"
+      class="form-control form-control-sm w-auto flex-grow-1"
+      placeholder="filter by name or path, e.g. .thickness"
+      aria-label="Filter parameters"
+    />
+  </div>
   <table class="table">
     <thead class="border-bottom py-1 sticky-top text-white bg-secondary">
       <tr>
@@ -82,7 +106,7 @@ async function setFittable(event: MouseEvent, index: number) {
       </tr>
     </thead>
     <tbody>
-      <tr v-for="{ parameter: param, index } in tag_filter?.filtered_parameters" :key="param.id" class="py-1">
+      <tr v-for="{ parameter: param, index } in visible_parameters" :key="param.id" class="py-1">
         <td>
           <label class="visually-hidden" for="`param-checkbox-${index}`">Fit?</label>
           <input
