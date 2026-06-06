@@ -53,7 +53,7 @@ import traceback
 import time
 
 from bumps.fitproblem import load_problem
-from bumps.fitters import FitDriver, OptimizeResult, FIT_DEFAULT_ID, FIT_ACTIVE_IDS
+from bumps.fitters import FitDriver, OptimizeResult, FIT_DEFAULT_ID, FIT_ACTIVE_IDS, fit_quality
 from bumps.mapper import MPMapper
 from bumps.parameter import Parameter, Constant, Variable, unique
 import bumps.fitproblem
@@ -545,8 +545,10 @@ def export_fit(
         # Produce uncertainty plots
         # TODO: Add save/show methods to the fit_state protocol
         if hasattr(fit_state, "show"):
+            # Include overall fit quality (chisq, dof, points) in the -err.json report
+            show_options = {"extra": fit_quality(problem, fit_state)} if isinstance(fit_state, MCMCDraw) else {}
             with redirect_console(str(path / f"{basename}.err")):
-                fit_state.show(figfile=output_pathstr)
+                fit_state.show(figfile=output_pathstr, **show_options)
             fit_state.save(output_pathstr)
 
             # TODO: duplicates code in fitters.DreamFit.error_plot

@@ -860,6 +860,47 @@ class SnobFit(FitBase):
         return x, fx
 
 
+def fit_quality(problem, state) -> dict:
+    """
+    Return overall fit quality statistics for the uncertainty report.
+
+    *problem* is the fit problem and *state* is the MCMC state from a DREAM
+    fit. The negative log likelihood at the best point is recovered from the
+    state (the sampler stores log p = -nllf), so the model does not need to
+    be re-evaluated.
+
+    Returns a dictionary with *chisq* (normalized chi-squared at the best
+    point, at full precision), *dof* (degrees of freedom) and *points*
+    (number of data points). For a model with gaussian independent
+    uncertainties the raw sum of squares is chisq*dof.
+    """
+    _, best_logp = state.best()
+    nllf = -best_logp
+    return {
+        "chisq": problem.chisq(nllf=nllf),
+        "dof": problem.dof,
+        "points": problem.model_points(),
+    }
+
+
+def test_fit_quality():
+    class _Problem:
+        dof = 8
+
+        def chisq(self, nllf=None):
+            return 2 * nllf / self.dof
+
+        def model_points(self):
+            return 10
+
+    class _State:
+        def best(self):
+            return [1.0, 2.0], -20.0
+
+    quality = fit_quality(_Problem(), _State())
+    assert quality == {"chisq": 5.0, "dof": 8, "points": 10}
+
+
 class DreamModel:
     """
     DREAM wrapper for fit problems. Implements dream.core.Model protocol.
@@ -1019,7 +1060,7 @@ class DreamFit(FitBase):
         h5dump(group, state)
 
     def plot(self, output_path):
-        self.state.show(figfile=output_path)
+        self.state.show(figfile=output_path, extra=fit_quality(self.problem, self.state))
         self.error_plot(figfile=output_path)
 
     def show(self):
