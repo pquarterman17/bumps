@@ -713,6 +713,178 @@ def untag_all(parameter_tree, tag: Optional[str] = None):
 
 
 @dataclass
+class ParameterSite:
+    """
+    A location in an object graph holding a direct reference to a parameter.
+
+    *container* is the object holding the reference (dict, list, numpy object
+    array, or an arbitrary object via its ``__dict__``), *key* is the index,
+    dict key or attribute name within the container, *path* is a human-readable
+    dotted path from the walk root, and *mutable* indicates whether the
+    reference can be replaced in place (tuples and frozen containers cannot).
+    """
+
+    container: Any
+    key: Any
+    path: str
+    mutable: bool = True
+
+
+# Maximum recursion depth for the object-graph walk in find_parameter_sites.
+_SITE_WALK_MAX_DEPTH = 30
+
+
+def find_parameter_sites(root, target) -> List[ParameterSite]:
+    """
+    Find every direct reference to parameter *target* reachable from *root*.
+
+    Walks dicts, lists, tuples, sets, numpy object arrays and ordinary object
+    attributes (``__dict__``), recording each location where the *exact*
+    object *target* (identity comparison) is stored. The internals of
+    parameter machinery (Parameter, Variable, Expression, Calculation,
+    Constant) are not entered, so references inside expressions are not
+    reported; this walk reflects where the parameter is plugged into the
+    model, which is what identity-constraint editing operates on.
+
+    Use with :func:`replace_parameter_refs` to merge two parameters into one
+    (true identity constraint) or to split a shared parameter into
+    independent copies (uncoupling).
+    """
+    sites: List[ParameterSite] = []
+    visited = set()
+
+    def walk(obj, path, depth):
+        if depth > _SITE_WALK_MAX_DEPTH:
+            return
+        oid = builtins.id(obj)
+        if oid in visited:
+            return
+        # Leaf types that are either the parameter machinery itself or cannot
+        # usefully contain a model reference to a parameter.
+        if isinstance(obj, (Parameter, Variable, Expression, Calculation, Constant)):
+            return
+        if isinstance(obj, (str, bytes, bool, int, float, complex, type(None), type)):
+            return
+        if callable(obj) and not hasattr(obj, "__dict__"):
+            return
+        visited.add(oid)
+
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if v is target:
+                    sites.append(ParameterSite(obj, k, f"{path}[{k!r}]"))
+                else:
+                    walk(v, f"{path}[{k!r}]", depth + 1)
+        elif isinstance(obj, list):
+            for i, v in enumerate(obj):
+                if v is target:
+                    sites.append(ParameterSite(obj, i, f"{path}[{i}]"))
+                else:
+                    walk(v, f"{path}[{i}]", depth + 1)
+        elif isinstance(obj, np.ndarray):
+            if obj.dtype.kind == "O":
+                for i, v in enumerate(obj.flat):
+                    if v is target:
+                        sites.append(ParameterSite(obj, i, f"{path}[{i}]"))
+                    else:
+                        walk(v, f"{path}[{i}]", depth + 1)
+        elif isinstance(obj, (tuple, frozenset, set)):
+            for i, v in enumerate(obj):
+                if v is target:
+                    sites.append(ParameterSite(obj, i, f"{path}[{i}]", mutable=isinstance(obj, set)))
+                else:
+                    walk(v, f"{path}[{i}]", depth + 1)
+        elif hasattr(obj, "__dict__"):
+            for k, v in vars(obj).items():
+                if k.startswith("__"):
+                    continue
+                if v is target:
+                    sites.append(ParameterSite(obj, k, f"{path}.{k}"))
+                else:
+                    walk(v, f"{path}.{k}", depth + 1)
+
+    walk(root, "", 0)
+    return sites
+
+
+def replace_parameter_refs(root, target, replacement, paths: Optional[List[str]] = None) -> int:
+    """
+    Replace direct references to parameter *target* with *replacement* in the
+    object graph reachable from *root*, returning the number replaced.
+
+    If *paths* is given, only the sites whose path (as reported by
+    :func:`find_parameter_sites`) is listed are replaced; otherwise all
+    mutable sites are. Immutable sites (inside tuples) are skipped with a
+    warning. References inside expressions are not rewritten.
+
+    The caller is responsible for calling ``model_reset()`` on the fit
+    problem afterwards so that the fitted parameter list, priors and degrees
+    of freedom are rebuilt.
+    """
+    count = 0
+    for site in find_parameter_sites(root, target):
+        if paths is not None and site.path not in paths:
+            continue
+        if not site.mutable:
+            warnings.warn(f"cannot replace parameter reference in immutable container at {site.path}")
+            continue
+        if isinstance(site.container, dict):
+            site.container[site.key] = replacement
+        elif isinstance(site.container, list):
+            site.container[site.key] = replacement
+        elif isinstance(site.container, np.ndarray):
+            site.container.flat[site.key] = replacement
+        elif isinstance(site.container, set):
+            site.container.discard(target)
+            site.container.add(replacement)
+        else:
+            setattr(site.container, site.key, replacement)
+        count += 1
+    return count
+
+
+def test_parameter_sites():
+    class Layer:
+        def __init__(self, thickness):
+            self.thickness = thickness
+            self.extra = (thickness,)  # immutable reference
+
+    shared = Parameter(10.0, name="thickness")
+    other = Parameter(5.0, name="other")
+    a, b = Layer(shared), Layer(shared)
+    root = {"layers": [a, b], "other": other}
+
+    sites = find_parameter_sites(root, shared)
+    paths = sorted(s.path for s in sites)
+    # two mutable attribute sites plus two immutable tuple sites
+    assert paths == [
+        "['layers'][0].extra[0]",
+        "['layers'][0].thickness",
+        "['layers'][1].extra[0]",
+        "['layers'][1].thickness",
+    ], paths
+    assert sorted(s.path for s in sites if s.mutable) == [
+        "['layers'][0].thickness",
+        "['layers'][1].thickness",
+    ]
+
+    # Uncouple: give layer b its own copy
+    split = copy(shared)
+    n = replace_parameter_refs(root, shared, split, paths=["['layers'][1].thickness"])
+    assert n == 1
+    assert a.thickness is shared and b.thickness is split
+    assert split.id != shared.id and split.value == shared.value
+    split.value = 20.0
+    assert shared.value == 10.0  # independent after uncoupling
+
+    # Merge: replace all mutable references to `other` with `shared`
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # immutable tuple sites warn
+        n = replace_parameter_refs(root, other, shared)
+    assert n == 1 and root["other"] is shared
+
+
+@dataclass
 class Variable(ValueProtocol):
     """
     Saved state for a random variable in the model.

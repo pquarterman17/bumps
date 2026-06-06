@@ -46,7 +46,7 @@ import numpy as np
 import asyncio
 from pathlib import Path
 import json
-from copy import deepcopy
+from copy import copy, deepcopy
 import os
 import uuid
 import traceback
@@ -55,7 +55,16 @@ import time
 from bumps.fitproblem import load_problem
 from bumps.fitters import FitDriver, OptimizeResult, FIT_DEFAULT_ID, FIT_ACTIVE_IDS
 from bumps.mapper import MPMapper
-from bumps.parameter import Parameter, Constant, Variable, unique
+from bumps.parameter import (
+    Constraint,
+    Constant,
+    Expression,
+    Parameter,
+    Variable,
+    find_parameter_sites,
+    replace_parameter_refs,
+    unique,
+)
 import bumps.fitproblem
 import bumps.dream.stats
 from bumps.dream.state import MCMCDraw
@@ -1448,6 +1457,306 @@ async def set_parameter(
 
 def now_string():
     return f"{datetime.now().timestamp():.6f}"
+
+
+# ===== Constraints editor (issue #391) =====
+
+CONSTRAINT_OPS = ("<", "<=", ">", ">=")
+
+# Bookkeeping attributes of FitProblem that hold parameter references but are
+# rebuilt by model_reset(); they are not user-meaningful uncouple targets.
+_BOOKKEEPING_SITE_PREFIXES = ("._parameters", "._priors")
+
+
+def _get_fitproblem():
+    if state.problem is None or state.problem.fitProblem is None:
+        return None
+    return state.problem.fitProblem
+
+
+def _lookup_parameter(fitProblem, parameter_id: str) -> Optional[Parameter]:
+    parameter = fitProblem._parameters_by_id.get(parameter_id, None)
+    if parameter is None:
+        warnings.warn(f"parameter does not exist: {parameter_id}")
+    return parameter
+
+
+def _constraints_model_changed(fitProblem):
+    """Bookkeeping after a structural change to the parameter graph."""
+    fitProblem.model_reset()
+    fitProblem.model_update()
+    # model has been changed: setp and getp will return different values!
+    state.shared.updated_model = now_string()
+    # Reset the fitting state (uncertainty and population), no longer valid
+    state.reset_fitstate()
+    state.shared.updated_parameters = now_string()
+
+
+def _model_sites(fitProblem, parameter):
+    """Parameter reference sites, excluding FitProblem bookkeeping."""
+    sites = find_parameter_sites(fitProblem, parameter)
+    return [s for s in sites if not s.path.startswith(_BOOKKEEPING_SITE_PREFIXES)]
+
+
+def _identity_paths(params, lookup, path=""):
+    """
+    Collect the model paths of each parameter, keyed by id.
+
+    Unlike params_to_list this does not descend into parameter slots, so a
+    parameter only counts as shared (identity constraint) when it is plugged
+    into more than one place in the model itself.
+    """
+    if isinstance(params, dict):
+        for k in sorted(params.keys()):
+            _identity_paths(params[k], lookup, f"{path}{'.' if path else ''}{k}")
+    elif isinstance(params, (tuple, list, np.ndarray)):
+        for i, v in enumerate(params):
+            _identity_paths(v, lookup, f"{path}[{i:d}]")
+    elif isinstance(params, (Parameter, Constant)):
+        pid = getattr(params, "id", None)
+        if pid is not None:
+            lookup.setdefault(pid, (params, []))[1].append(path)
+
+
+@register
+async def get_constraints_info():
+    """
+    Summary of all constraints in the model, for the constraints editor panel:
+
+    - *inequalities*: the FitProblem.constraints list (a < b style)
+    - *links*: parameters whose slot is another parameter or an expression
+      (equality constraints), with whether they can be unlinked
+    - *identities*: parameters appearing at more than one location in the
+      model (identity constraints), with their paths
+    """
+    fitProblem = _get_fitproblem()
+    if fitProblem is None:
+        return None
+    inequalities = [
+        {"index": i, "text": str(c), "satisfied": bool(c.satisfied)} for i, c in enumerate(fitProblem.constraints)
+    ]
+    links = []
+    for p in unique(fitProblem.model_parameters()):
+        slot = getattr(p, "slot", None)
+        if isinstance(slot, (Expression, Parameter)) and getattr(p, "id", None) is not None:
+            links.append({"id": p.id, "name": str(p.name), "slot_repr": str(slot)})
+    path_lookup = {}
+    _identity_paths(fitProblem.model_parameters(), path_lookup)
+    identities = [
+        {"id": pid, "name": str(p.name), "value_str": VALUE_FORMAT.format(nice(p.value)), "paths": paths}
+        for pid, (p, paths) in path_lookup.items()
+        if len(paths) > 1
+    ]
+    return to_json_compatible_dict(dict(inequalities=inequalities, links=links, identities=identities))
+
+
+@register
+async def get_parameter_sites(parameter_id: str):
+    """
+    List the locations in the model holding a direct reference to the
+    parameter, for selecting which occurrences to uncouple.
+    """
+    fitProblem = _get_fitproblem()
+    if fitProblem is None:
+        return None
+    parameter = _lookup_parameter(fitProblem, parameter_id)
+    if parameter is None:
+        return {"error": f"parameter does not exist: {parameter_id}"}
+    sites = _model_sites(fitProblem, parameter)
+    return to_json_compatible_dict([{"path": s.path, "mutable": s.mutable} for s in sites])
+
+
+@register
+async def link_parameters(target_ids: List[str], source_id: str):
+    """
+    Create equality constraints: each target parameter is set equal to the
+    source parameter (target.equals(source)). Reversible with
+    unlink_parameters.
+    """
+    fitProblem = _get_fitproblem()
+    if fitProblem is None:
+        return None
+    source = _lookup_parameter(fitProblem, source_id)
+    if source is None:
+        return {"error": f"source parameter does not exist: {source_id}"}
+    linked, errors = 0, []
+    for target_id in target_ids:
+        target = _lookup_parameter(fitProblem, target_id)
+        if target is None:
+            errors.append(f"parameter does not exist: {target_id}")
+            continue
+        if target is source:
+            errors.append(f"cannot link {target.name} to itself")
+            continue
+        # The source's dependency chain must not contain the target, else
+        # evaluation would recurse forever.
+        if any(q is target for q in source.parameters()):
+            errors.append(f"linking {target.name} to {source.name} would create a circular reference")
+            continue
+        try:
+            target.equals(source)
+        except TypeError as exc:
+            errors.append(f"{target.name}: {exc}")
+            continue
+        linked += 1
+    if linked:
+        _constraints_model_changed(fitProblem)
+    return to_json_compatible_dict({"linked": linked, "errors": errors})
+
+
+@register
+async def unlink_parameters(parameter_ids: List[str]):
+    """
+    Remove equality constraints: each parameter gets an independent variable
+    initialized to its current value.
+    """
+    fitProblem = _get_fitproblem()
+    if fitProblem is None:
+        return None
+    unlinked, errors = 0, []
+    for parameter_id in parameter_ids:
+        parameter = _lookup_parameter(fitProblem, parameter_id)
+        if parameter is None:
+            errors.append(f"parameter does not exist: {parameter_id}")
+            continue
+        if not isinstance(parameter.slot, (Expression, Parameter)):
+            errors.append(f"{parameter.name} is not linked")
+            continue
+        try:
+            parameter.unlink()
+        except TypeError as exc:
+            errors.append(f"{parameter.name}: {exc}")
+            continue
+        unlinked += 1
+    if unlinked:
+        _constraints_model_changed(fitProblem)
+    return to_json_compatible_dict({"unlinked": unlinked, "errors": errors})
+
+
+@register
+async def merge_parameters(keep_id: str, remove_ids: List[str]):
+    """
+    Create identity constraints: every model reference to each parameter in
+    *remove_ids* is replaced with a reference to the *keep_id* parameter, so
+    all locations share one Parameter object.
+
+    References inside expressions are not rewritten; if a removed parameter
+    is still used by an expression it is reported in *still_referenced*.
+    """
+    fitProblem = _get_fitproblem()
+    if fitProblem is None:
+        return None
+    keep = _lookup_parameter(fitProblem, keep_id)
+    if keep is None:
+        return {"error": f"parameter does not exist: {keep_id}"}
+    merged, errors, still_referenced = 0, [], []
+    for remove_id in remove_ids:
+        parameter = _lookup_parameter(fitProblem, remove_id)
+        if parameter is None:
+            errors.append(f"parameter does not exist: {remove_id}")
+            continue
+        if parameter is keep:
+            errors.append(f"cannot merge {parameter.name} with itself")
+            continue
+        if any(q is parameter for q in keep.parameters()):
+            errors.append(f"cannot merge {parameter.name}: {keep.name} is an expression of it")
+            continue
+        replaced = replace_parameter_refs(fitProblem, parameter, keep)
+        if replaced == 0:
+            errors.append(f"no model references found for {parameter.name}")
+            continue
+        merged += 1
+        if any(q is parameter for q in unique(fitProblem.model_parameters())):
+            still_referenced.append(str(parameter.name))
+    if merged:
+        _constraints_model_changed(fitProblem)
+    return to_json_compatible_dict({"merged": merged, "errors": errors, "still_referenced": still_referenced})
+
+
+@register
+async def uncouple_parameter(parameter_id: str, paths: Optional[List[str]] = None):
+    """
+    Remove identity constraints: occurrences of a shared parameter get their
+    own independent copies (same name, value and bounds; new id).
+
+    If *paths* is given (from get_parameter_sites), only those occurrences
+    are split off; otherwise every occurrence after the first gets a copy.
+    """
+    fitProblem = _get_fitproblem()
+    if fitProblem is None:
+        return None
+    parameter = _lookup_parameter(fitProblem, parameter_id)
+    if parameter is None:
+        return {"error": f"parameter does not exist: {parameter_id}"}
+    sites = [s for s in _model_sites(fitProblem, parameter) if s.mutable]
+    if len(sites) < 2:
+        return {"error": f"{parameter.name} is not shared: nothing to uncouple"}
+    if paths is None:
+        # Split every occurrence after the first into its own copy.
+        split_paths = [s.path for s in sites[1:]]
+    else:
+        known = set(s.path for s in sites)
+        unknown = [p for p in paths if p not in known]
+        if unknown:
+            return {"error": f"unknown parameter locations: {unknown}"}
+        if len(paths) >= len(sites):
+            # Keep at least one occurrence on the original parameter.
+            paths = paths[: len(sites) - 1]
+        split_paths = paths
+    new_ids = []
+    for path in split_paths:
+        replacement = copy(parameter)
+        replace_parameter_refs(fitProblem, parameter, replacement, paths=[path])
+        new_ids.append(replacement.id)
+    if new_ids:
+        _constraints_model_changed(fitProblem)
+    return to_json_compatible_dict({"uncoupled": len(new_ids), "new_ids": new_ids})
+
+
+@register
+async def add_constraint(left_id: str, op: str, right_id: Optional[str] = None, right_value: Optional[float] = None):
+    """
+    Add an inequality constraint (left op right) to FitProblem.constraints.
+    The right side is either another parameter (right_id) or a number
+    (right_value).
+    """
+    fitProblem = _get_fitproblem()
+    if fitProblem is None:
+        return None
+    if op not in CONSTRAINT_OPS:
+        return {"error": f"unknown operator {op!r}: expected one of {CONSTRAINT_OPS}"}
+    left = _lookup_parameter(fitProblem, left_id)
+    if left is None:
+        return {"error": f"parameter does not exist: {left_id}"}
+    if right_id is not None:
+        right = _lookup_parameter(fitProblem, right_id)
+        if right is None:
+            return {"error": f"parameter does not exist: {right_id}"}
+        if right is left:
+            return {"error": f"cannot constrain {left.name} against itself"}
+    elif right_value is not None:
+        right = float(right_value)
+    else:
+        return {"error": "constraint needs either right_id or right_value"}
+    constraint = Constraint(left, right, op)
+    fitProblem.constraints = list(fitProblem.constraints) + [constraint]
+    _constraints_model_changed(fitProblem)
+    return to_json_compatible_dict({"text": str(constraint), "satisfied": bool(constraint.satisfied)})
+
+
+@register
+async def remove_constraint(index: int):
+    """Remove the inequality constraint at *index* in FitProblem.constraints."""
+    fitProblem = _get_fitproblem()
+    if fitProblem is None:
+        return None
+    constraints = list(fitProblem.constraints)
+    if not (0 <= index < len(constraints)):
+        return {"error": f"no constraint at index {index}"}
+    removed = constraints.pop(index)
+    fitProblem.constraints = constraints
+    _constraints_model_changed(fitProblem)
+    return to_json_compatible_dict({"removed": str(removed)})
 
 
 @register

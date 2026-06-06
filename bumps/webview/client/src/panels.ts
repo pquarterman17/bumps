@@ -1,4 +1,5 @@
 import { shared_state } from "./app_state";
+import ConstraintsView from "./components/ConstraintsView.vue";
 import ConvergenceView from "./components/ConvergenceView.vue";
 import CorrelationView from "./components/CorrelationViewPlotly.vue";
 import CustomPlot from "./components/CustomPlot.vue";
@@ -26,6 +27,7 @@ export const panels: Panel[] = [
   { title: "Convergence", component: ConvergenceView },
   { title: "Model", component: ModelInspect },
   { title: "Parameters", component: ParameterView },
+  { title: "Constraints", component: ConstraintsView },
   { title: "Correlations", component: CorrelationView, show: show_uncertainty },
   { title: "Trace", component: ParameterTraceView, show: show_uncertainty },
   { title: "Model Uncertainty", component: ModelUncertaintyView, show: show_uncertainty },
